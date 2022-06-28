@@ -1,0 +1,289 @@
+version: 2.1
+
+orbs:
+  win: circleci/windows@2.4.0
+
+parameters:
+  run-build-kedro-telemetry:
+    type: boolean
+    default: false
+  run-build-kedro-docker:
+    type: boolean
+    default: false
+  run-build-kedro-airflow:
+    type: boolean
+    default: false
+  run-build-kedro-datasets:
+    type: boolean
+    default: false
+
+
+commands:
+  setup_conda:
+    parameters:
+      python_version:
+        type: string
+    steps:
+      - run:
+          name: setup_conda
+          command: echo "setup conda"
+
+  setup_requirements:
+    parameters:
+      plugin:
+        type: string
+    steps:
+      - run:
+          name: setup_requirements
+          command: echo "setup_requirements"
+
+  setup:
+    parameters:
+      python_version:
+        type: string
+      plugin:
+        type: string
+    steps:
+      - checkout
+      - setup_conda:
+          python_version: <<parameters.python_version>>
+      - setup_requirements:
+          plugin: <<parameters.plugin>>
+  win_setup_conda:
+    # Miniconda3 is pre-installed on the machine:
+    # https://circleci.com/docs/2.0/hello-world-windows
+    parameters:
+      python_version:
+        type: string
+    steps:
+      - run:
+          name: win_setup_conda
+          command: echo "setup win_setup_conda"
+
+  win_setup_env:
+    steps:
+      - run:
+          # Required for Tensorflow tests
+          name: win_setup_env
+          command: echo "win_setup_env"
+
+  win_setup_requirements:
+    parameters:
+      plugin:
+        type: string
+      python_version:
+        type: string
+    steps:
+      - run:
+          name: win_setup_requirements
+          command: echo "win_setup_requirements"
+
+
+
+jobs:
+  unit_tests:
+    parameters:
+      python_version:
+        type: string
+      plugin:
+        type: string
+    machine:
+      image: ubuntu-2004:202201-02
+      docker_layer_caching: true
+    steps:
+      - setup:
+          python_version: <<parameters.python_version>>
+          plugin: <<parameters.plugin>>
+      - run:
+          name: Run unit tests
+          command: make plugin=<<parameters.plugin>> test
+
+  e2e_tests:
+    parameters:
+      python_version:
+        type: string
+      plugin:
+        type: string
+    machine:
+      image: ubuntu-2004:202201-02
+      docker_layer_caching: true
+    steps:
+      - setup:
+          python_version: <<parameters.python_version>>
+          plugin: <<parameters.plugin>>
+      - run:
+          name: Run e2e tests
+          command: make plugin=<<parameters.plugin>> e2e-tests
+
+  lint:
+    parameters:
+      plugin:
+        type: string
+    machine:
+      image: ubuntu-2004:202201-02
+      docker_layer_caching: true
+    steps:
+      - setup:
+          python_version: "3.8"
+          plugin: <<parameters.plugin>>
+      - run:
+          name: Run pylint and flake8
+          command: make plugin=<<parameters.plugin>> lint
+
+  win_unit_tests:
+    parameters:
+      python_version:
+        type: string
+      plugin:
+        type: string
+    executor:
+      name: win/default
+    steps:
+      - checkout
+      - win_setup_conda:
+          python_version: <<parameters.python_version>>
+      - when:
+          python_version: <<parameters.python_version>>
+          condition:
+            equal: [true, <<pipeline.parameters.run-build-kedro-datasets>>]
+          steps:
+            win_setup_env
+      - win_setup_requirements:
+          plugin: <<parameters.plugin>>
+          python_version: <<parameters.python_version>>
+      # For anything not `kedro-datasets`
+      - unless:
+          condition:
+            equal: [false, <<pipeline.parameters.run-build-kedro-datasets>>]
+
+          # e2e tests are not currently runnable on CircleCI on Windows as
+          # those require the ability to run Linux containers:
+          # "The Windows executor currently only supports Windows containers.
+          # Running Linux containers on Windows is not possible for now"
+          # (from https://circleci.com/docs/2.0/hello-world-windows/)
+          steps:
+            - run:
+                name: Run unit tests
+                command: |
+                  conda activate kedro_plugins
+                  cd <<parameters.plugin>>
+                  pytest tests
+
+      - run:
+          # geopandas and tensorflow conflicts when imported simultaneously.
+          # The HDF5 header files used to compile this application do not match
+          # the version used by the HDF5 library to which this application is linked.
+          # Data corruption or segmentation faults may occur if the application continues.
+          # This can happen when an application was compiled by one version of HDF5 but
+          # linked with a different version of static or shared HDF5 library.
+          # You should recompile the application or check your shared library related
+          # settings such as 'LD_LIBRARY_PATH'.
+          # You can, at your own risk, disable this warning by setting the environment
+          # variable 'HDF5_DISABLE_VERSION_CHECK' to a value of '1'.
+          # Setting it to 2 or higher will suppress the warning messages totally.
+          name: Set HDF5_DISABLE_VERSION_CHECK environment variable
+          command: setx /m HDF5_DISABLE_VERSION_CHECK 1
+      - unless:
+          condition:
+            and:
+              - equal: [ "3.10", <<parameters.python_version>> ]
+              - equal: [true, <<pipeline.parameters.run-build-kedro-datasets>>]
+          steps:
+            - run:
+                name: Run unit tests without spark in parallel
+                command: conda activate kedro_datasets; make test-no-spark
+      - when:
+          condition:
+            and:
+              - equal: [ "3.10", <<parameters.python_version>> ]
+              - equal: [true, <<pipeline.parameters.run-build-kedro-datasets>>]
+          steps:
+            - run:
+                name: Run unit tests without spark sequentially
+                command: conda activate kedro_datasets; pytest tests --no-cov --ignore tests/extras/datasets/spark
+
+
+workflows:
+  # when pipeline parameter, run-build-kedro-telemetry is true, the
+  # kedro-telemetry job is triggered.
+  kedro-telemetry:
+    when: <<pipeline.parameters.run-build-kedro-telemetry>>
+    jobs:
+      - unit_tests:
+          plugin: "kedro-telemetry"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - win_unit_tests:
+          plugin: "kedro-telemetry"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - lint:
+          plugin: "kedro-telemetry"
+  # when pipeline parameter, run-build-kedro-docker is true, the
+  # kedro-docker job is triggered.
+  kedro-docker:
+    when: <<pipeline.parameters.run-build-kedro-docker>>
+    jobs:
+      - unit_tests:
+          plugin: "kedro-docker"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - e2e_tests:
+          plugin: "kedro-docker"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - win_unit_tests:
+          plugin: "kedro-docker"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - lint:
+          plugin: "kedro-docker"
+  # when pipeline parameter, run-build-kedro-airflow is true, the
+  # kedro-airflow job is triggered.
+  kedro-airflow:
+    when: <<pipeline.parameters.run-build-kedro-airflow>>
+    jobs:
+      - unit_tests:
+          plugin: "kedro-airflow"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - e2e_tests:
+          plugin: "kedro-airflow"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - win_unit_tests:
+          plugin: "kedro-airflow"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - lint:
+          plugin: "kedro-airflow"
+  # when pipeline parameter, run-build-kedro-datasets is true, the
+  # kedro-datasets job is triggered.
+  kedro-datasets:
+    when: <<pipeline.parameters.run-build-kedro-datasets>>
+    jobs:
+      - unit_tests:
+          plugin: "kedro-datasets"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      # - e2e_tests:
+      #     plugin: "kedro-datasets"
+      #     matrix:
+      #       parameters:
+      #         python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - win_unit_tests:
+          plugin: "kedro-datasets"
+          matrix:
+            parameters:
+              python_version: ["3.7", "3.8", "3.9", "3.10"]
+      - lint:
+          plugin: "kedro-datasets"
